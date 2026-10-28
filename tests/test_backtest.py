@@ -1,7 +1,7 @@
 import unittest
 import numpy as np
 import pandas as pd
-from backtest import signal_series, run_backtest, STRATEGIES
+from backtest import signal_series, run_backtest, walk_forward_backtest, STRATEGIES
 
 class BacktestTests(unittest.TestCase):
     def sample(self, n=500):
@@ -39,6 +39,12 @@ class BacktestTests(unittest.TestCase):
     def test_invalid_capital(self):
         with self.assertRaises(ValueError):
             run_backtest(self.sample(), "EMA crossover", 0)
+
+    def test_walk_forward_returns_sequential_folds(self):
+        out = walk_forward_backtest(self.sample(600), "EMA crossover", folds=4)
+        self.assertEqual(len(out["folds"]), 4)
+        self.assertIn("Доходность, %", out["folds"].columns)
+        self.assertEqual(len(out["curves"]), 4)
 
 if __name__ == "__main__":
     unittest.main()
