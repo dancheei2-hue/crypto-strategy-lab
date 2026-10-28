@@ -1,35 +1,39 @@
 # Crypto Strategy Lab
 
-Russian-language crypto strategy research MVP with selectable public market data from Binance or Bybit.
+Веб-приложение на Streamlit для исследования криптостратегий по публичным историческим котировкам. Python 3.11+ (рекомендуется 3.12).
 
-## Run
+## Возможности
+- Биржи котировок: Binance, Bybit, BingX (доступность зависит от рынка и региона размещения).
+- Spot и linear/futures через публичный API, без ключей для загрузки свечей.
+- Таймфреймы 5m, 15m, 30m, 1h, 2h, 4h, 1d и выбор глубины истории.
+- Стратегии: EMA crossover, RSI mean reversion, Donchian breakout, MACD trend, Bollinger reversion, ATR trend filter, EMA + RSI confirmation, Buy & Hold benchmark.
+- Комиссия, проскальзывание, размер позиции, модельное плечо и допущение funding.
+- Метрики доходности, CAGR (оценка), максимальная просадка, Sharpe, Sortino, win rate, profit factor, лучшие/худшие сделки и время в рынке.
+- Сравнение кривых капитала; экспорт метрик, сделок, свечей и конфигурации эксперимента.
+- Binance spot загружает свечи через публичный `data-api.binance.vision`, минуя `exchangeInfo`.
+
+## Запуск
 ```bash
 python -m venv .venv
-# Windows: .venv\Scripts\activate
+# Windows PowerShell: .venv\Scripts\Activate.ps1
 # macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-The app lets you select Binance or Bybit and downloads public OHLCV candles via CCXT. No API keys are required for public candles. It excludes the latest candle because it may still be open. Availability depends on the hosting region and exchange restrictions; Binance may also be blocked in some regions.
+## Развёртывание Streamlit Community Cloud
+Укажите репозиторий, ветку `main` и основной файл `app.py`. После замены файлов дождитесь перезапуска приложения или перезапустите его вручную.
 
-## Included baseline strategies
-- EMA crossover (12/26)
-- RSI mean reversion (14; entry below 30, exit above 55)
-- Donchian breakout (20-bar breakout, 10-bar exit)
+## Ограничения и честная интерпретация
+- Это исследовательский бэктестер, не доказательство прибыльности.
+- Сигнал сдвигается на одну свечу, чтобы не совершать сделку по закрытию свечи, которая породила сигнал.
+- Spot ограничен длинными позициями; futures поддерживают упрощённое направление short для стратегии EMA. Реальная логика контрактов зависит от биржи.
+- OOS-разделение сейчас показывает отдельный запуск на holdout-отрезке с повторной инициализацией индикаторов. Это не полноценный walk-forward-тест; результаты следует воспринимать предварительно.
+- Funding задаётся вручную как допущение; ликвидации, funding history, биржевые минимумы, лоты, точные комиссии и рыночное проскальзывание не моделируются.
+- PnL сделок — приблизительная оценка изменения капитала между переходами позиции, а не биржевая выписка исполнения.
+- Автоматическая и реальная торговля не включены. API-ключи не нужны и не должны вставляться в этот демо-интерфейс.
 
-## Important model limitations
-- These are baseline research implementations, not proven profitable systems.
-- Signals are delayed by one candle to avoid trading on the same candle close that creates the signal.
-- Fee and slippage inputs are explicit, editable assumptions.
-- Linear-futures funding is an approximation based on the user-entered rate, not historical funding data.
-- This MVP does not submit real orders and does not collect API secrets.
-- Trade-by-trade PnL is an approximation from changes in equity around position transitions. Review before relying on results for decisions.
-- The initial train/OOS split evaluates each segment separately; indicators in the OOS slice are initialized on the OOS data, so this is a basic holdout report rather than a production-grade walk-forward framework.
-- Liquidation, exchange-specific minimum order sizes, and exact fee tiers are not modeled yet.
-- Small balances can be materially affected by minimum order sizes and fees.
-
-## Tests
+## Тесты
 ```bash
 python -m unittest discover -s tests -v
 ```
