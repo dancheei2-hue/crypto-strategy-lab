@@ -306,3 +306,45 @@ def run_backtest(df, strategy, initial_equity=100.0, market="spot", fee=0.001,
     metrics["Средняя экспозиция, x"] = round(float(position.abs().mean()), 3)
     metrics["Средний бар, %"] = round(float(net_returns.mean() * 100), 5)
     return {"metrics": metrics, "equity": equity, "trades": trades_df, "position": position, "returns": net_returns}
+
+
+def walk_forward_backtest(df, strategy, initial_equity=100.0, market="spot", fee=0.001,
+                          slippage=0.0005, leverage=1.0, funding_8h=0.0001, params=None,
+                          position_size_pct=100.0, folds=5):
+    """Evaluate sequential out-of-sample folds using causal signals computed with prior history.
+
+    Parameters are fixed, not optimized per fold. The first fold starts after a warm-up period.
+    Each fold starts from the same notional initial equity for comparability.
+    """
+    if len(df) < max(200, folds * 30):
+        raise ValueError("Для walk-forward нужно больше истории: минимум 200 свечей и около 30 на fold.")
+    folds = max(2, min(int(folds), 10))
+    # Signals/indicators use only current and past data; shift occurs in run_backtest.
+    # Running on full history preserves indicator warm-up before each evaluation segment.
+    full = run_backtest(df, strategy, initial_equity, market, fee, slippage, leverage,
+                        funding_8h, params=params, position_size_pct=position_size_pct)
+    warmup = max(50, int(len(df) * 0.2))
+    available = len(df) - warmup
+    if available < folds * 10:
+        raise ValueError("Недостаточно свечей после прогрева индикаторов для выбранного числа folds.")
+    chunk = available // folds
+    rows, curves = [], {}
+    net = full["returns"]
+    for i in range(folds):
+        start = warmup + i * chunk
+        end = warmup + (i + 1) * chunk if i < folds - 1 else len(df)
+        segment = net.iloc[start:end].copy()
+        if segment.empty: continue
+        equity = float(initial_equity) * (1 + segment).cumprod()
+        peak = equity.cummax()
+        dd = float(((equity / peak) - 1).min() * 100)
+        seconds = df.index.to_series().diff().dt.total_seconds().median()
+        ppy = (365.25 * 24 * 3600 / seconds) if pd.notna(seconds) and seconds > 0 else 365.25
+        std = float(segment.std(ddof=1)) if len(segment) > 1 else 0.0
+        sharpe = float(segment.mean() / std * np.sqrt(ppy)) if std > 0 else 0.0
+        rows.append({"Fold": i + 1, "Начало OOS": str(segment.index.min()), "Конец OOS": str(segment.index.max()),
+                     "Свечей": len(segment), "Доходность, %": round((float(equity.iloc[-1]) / initial_equity - 1) * 100, 3),
+                     "Макс. просадка, %": round(dd, 3), "Sharpe": round(sharpe, 3),
+                     "Положительный fold": bool(float(equity.iloc[-1]) > initial_equity)})
+        curves[f"Fold {i+1}"] = equity.rename(f"Fold {i+1}")
+    return {"folds": pd.DataFrame(rows), "curves": curves, "full": full}

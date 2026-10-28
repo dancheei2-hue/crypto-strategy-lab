@@ -6,7 +6,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from backtest import fetch_ohlcv, run_backtest, STRATEGIES
+from backtest import fetch_ohlcv, run_backtest, walk_forward_backtest, signal_series, STRATEGIES
+from paper import get_account, reset_account, get_events, process_closed_candle
 
 st.set_page_config(page_title="Crypto Strategy Lab", page_icon="📈", layout="wide")
 st.title("Crypto Strategy Lab")
@@ -120,7 +121,7 @@ if res:
     st.line_chart(chart_df, use_container_width=True, height=380)
     st.subheader("Цена и границы выборки")
     st.line_chart(res["data"]["close"].rename("Close"), use_container_width=True, height=220)
-    st.caption(f"Train: до {res['train'].index.max()} UTC. OOS: с {res['test'].index.min()} UTC. Отдельный OOS-запуск в этой версии перезапускает индикаторы на начале OOS, поэтому считайте его предварительной оценкой, не walk-forward-валидацией.")
+    st.caption(f"Train: до {res['train'].index.max()} UTC. OOS: с {res['test'].index.min()} UTC. Для последовательной оценки ниже используйте walk-forward.")
     st.subheader("Сделки")
     which = st.selectbox("Стратегия и период", list(res["trades"].keys()))
     trades = res["trades"][which]
@@ -140,7 +141,74 @@ if res:
     st.download_button("Исходные свечи CSV", csv_buf.getvalue().encode("utf-8-sig"), "ohlcv.csv", "text/csv")
     st.download_button("Настройки эксперимента JSON", json.dumps({"exchange": res["exchange"], "market": res["market"], "symbol": res["symbol"], "timeframe": res["timeframe"], "months": res["months"], "params": res["params"], "settings": res["settings"], "selected_strategies": list(res["detail"].keys()), "generated_at_utc": datetime.now(timezone.utc).isoformat()}, ensure_ascii=False, indent=2).encode("utf-8"), "experiment_config.json", "application/json")
 
-st.divider()
-st.header("Paper trading и автоматизация")
-st.write("Этот интерфейс пока исследовательский: он не отправляет ордера, не держит постоянный процесс между перезапусками Streamlit и не хранит API-ключи. Следующий безопасный этап — симуляция paper trading на свежих закрытых свечах с журналом сигналов и позиций. Реальную автоторговлю следует добавлять отдельно с лимитами риска, защитой ключей, журналом действий и аварийной остановкой.")
-st.warning("Результаты — модель, а не финансовая рекомендация. В текущей версии не моделируются ликвидации, минимальные размеры ордеров, точные комиссии биржи и реальная историческая ставка funding.")
+    st.divider()
+    st.header("4. Walk-forward проверка")
+    st.write("Последовательная проверка на нескольких временных отрезках. Параметры фиксированы и не подбираются по каждому fold; индикаторы получают предшествующую историю. Это снижает проблему перезапуска индикаторов на границе, но не заменяет проверку исполнения на реальном рынке.")
+    wf_strategy = st.selectbox("Стратегия для walk-forward", list(res["detail"].keys()), key="wf_strategy")
+    wf_folds = st.slider("Количество последовательных OOS-отрезков", 3, 8, 5, key="wf_folds")
+    if st.button("Запустить walk-forward", key="run_wf"):
+        try:
+            settings = res["settings"]
+            wf = walk_forward_backtest(res["data"], wf_strategy, res["initial"], res["market"],
+                settings["fee_pct"]/100, settings["slippage_pct"]/100, settings["leverage"],
+                settings["funding_pct_8h"]/100, params=res["params"],
+                position_size_pct=settings["position_size"], folds=wf_folds)
+            st.session_state.wf_result = {"table": wf["folds"], "curves": wf["curves"], "strategy": wf_strategy}
+        except Exception as exc:
+            st.error(f"Walk-forward не выполнен: {exc}")
+    wf_res = st.session_state.get("wf_result")
+    if wf_res:
+        st.dataframe(wf_res["table"], use_container_width=True, hide_index=True)
+        st.line_chart(pd.concat(list(wf_res["curves"].values()), axis=1), use_container_width=True, height=260)
+        st.download_button("Скачать walk-forward CSV", wf_res["table"].to_csv(index=False).encode("utf-8-sig"), "walk_forward.csv", "text/csv")
+
+    st.divider()
+    st.header("5. Paper trading — симуляция без реальных ордеров")
+    st.caption("Paper-счёт использует виртуальные покупки/продажи только на споте. Обработка идёт по кнопке, максимум одна обработка на закрытую свечу. На Streamlit Cloud SQLite-файл может сброситься при пересоздании контейнера; это не круглосуточный сервис.")
+    paper_strategy = st.selectbox("Стратегия paper-счёта", list(STRATEGIES.keys()), index=list(STRATEGIES.keys()).index("EMA crossover"), key="paper_strategy")
+    paper_cash = st.number_input("Начальный виртуальный баланс, USDT", min_value=10.0, max_value=1000000.0, value=1000.0, step=100.0, key="paper_cash")
+    acc = get_account()
+    p1, p2 = st.columns(2)
+    with p1:
+        if st.button("Создать / сбросить paper-счёт", key="reset_paper"):
+            reset_account(paper_cash)
+            st.success("Виртуальный счёт создан. История предыдущего paper-счёта очищена.")
+            st.rerun()
+    with p2:
+        if st.button("Обработать последнюю закрытую свечу", key="process_paper"):
+            if res["market"] != "spot":
+                st.error("Для этой первой версии paper trading выберите Spot, затем повторно загрузите котировки.")
+            elif not acc:
+                st.error("Сначала создайте paper-счёт.")
+            else:
+                try:
+                    paper_data = res["data"]
+                    # Current loaded dataset already excludes the unfinished candle.
+                    sig = signal_series(paper_data, paper_strategy, res["params"])
+                    latest_ts = paper_data.index[-1]
+                    outcome = process_closed_candle(latest_ts, res["symbol"], paper_strategy,
+                        float(paper_data["close"].iloc[-1]), float(sig.iloc[-1]),
+                        res["settings"]["fee_pct"]/100, res["settings"]["slippage_pct"]/100)
+                    if outcome["status"] == "duplicate": st.info(outcome["message"])
+                    else: st.success(f"Обработано: {outcome['action']} • капитал по последней цене: {outcome['equity']:.2f} USDT")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Paper trading: {exc}")
+    acc = get_account()
+    if acc:
+        mark_price = float(res["data"]["close"].iloc[-1]) if res else 0.0
+        qty = float(acc["quantity"])
+        equity = float(acc["cash"]) + qty * mark_price
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Виртуальный капитал", f"{equity:.2f} USDT", f"{equity-float(acc['initial_cash']):+.2f}")
+        m2.metric("Свободные средства", f"{float(acc['cash']):.2f} USDT")
+        m3.metric("Количество актива", f"{qty:.8f}")
+        m4.metric("Цена оценки", f"{mark_price:.4f} USDT" if mark_price else "—")
+        events = get_events()
+        st.subheader("Журнал виртуальных операций")
+        if events.empty: st.info("Пока нет записей. Обработайте свечу после создания счёта.")
+        else:
+            st.dataframe(events, use_container_width=True, hide_index=True)
+            st.download_button("Скачать журнал paper trading CSV", events.to_csv(index=False).encode("utf-8-sig"), "paper_trading_journal.csv", "text/csv")
+
+st.warning("Результаты бэктеста не гарантируют доходность. Не моделируются ликвидации, биржевые минимумы, точные уровни комиссий и исторический funding. Paper trading не отправляет ордера и не должен использоваться как подтверждение готовности стратегии к реальным деньгам.")
