@@ -1,277 +1,267 @@
-import io
 import json
 from datetime import datetime, timezone
 
-import numpy as np
 import pandas as pd
 import streamlit as st
 
-from backtest import fetch_ohlcv, run_backtest, walk_forward_backtest, signal_series, STRATEGIES
-from paper import get_account, reset_account, get_events, process_closed_candle
+from backtest import fetch_ohlcv, run_backtest, signal_series, STRATEGIES
 from auto_research import automatic_research
 from regime_engine import adaptive_regime_backtest
+from paper import get_account, reset_account, get_events, process_closed_candle
 
 st.set_page_config(page_title="Crypto Strategy Lab", page_icon="📈", layout="wide")
-st.title("Crypto Strategy Lab")
-st.caption("Лаборатория криптостратегий: котировки, бэктест, сравнение стратегий, риск и out-of-sample. Исторический результат не гарантирует будущую прибыль.")
 
-if "last_result" not in st.session_state:
-    st.session_state.last_result = None
+st.title("Crypto Strategy Lab")
+st.caption("Понятная проверка торговых идей. Сначала исследование и симуляция — без реальных ордеров.")
+
+# Keep the last loaded dataset and results available across Streamlit reruns.
+if "csl_data" not in st.session_state:
+    st.session_state.csl_data = None
+if "csl_result" not in st.session_state:
+    st.session_state.csl_result = None
+if "csl_auto" not in st.session_state:
+    st.session_state.csl_auto = None
+if "csl_adaptive" not in st.session_state:
+    st.session_state.csl_adaptive = None
 
 with st.sidebar:
-    st.header("1. Рынок и данные")
-    exchange_id = st.selectbox("Биржа котировок", ["binance", "bybit", "bingx"], format_func=lambda x: {"binance": "Binance", "bybit": "Bybit", "bingx": "BingX"}[x])
-    market = st.selectbox("Рынок", ["spot", "linear"], format_func=lambda x: "Спот" if x == "spot" else "USDT perpetual / фьючерсы")
-    symbol = st.text_input("Торговая пара", "BTC/USDT", help="Примеры: BTC/USDT, ETH/USDT, SOL/USDT. Доступность зависит от выбранной биржи и рынка.")
-    timeframe = st.selectbox("Таймфрейм", ["5m", "15m", "30m", "1h", "2h", "4h", "1d"], index=3)
-    months = st.select_slider("Глубина истории", options=[1, 3, 6, 12, 18, 24], value=12, format_func=lambda x: f"{x} мес.")
-    st.divider()
-    st.header("2. Модель исполнения")
-    initial = st.number_input("Стартовый капитал, USDT", min_value=10.0, max_value=1_000_000.0, value=1000.0, step=100.0)
-    fee_pct = st.number_input("Комиссия за сторону, %", min_value=0.0, max_value=1.0, value=0.10, step=0.01)
-    slippage_pct = st.number_input("Проскальзывание за сторону, %", min_value=0.0, max_value=2.0, value=0.05, step=0.01)
-    position_size = st.slider("Размер позиции, % капитала", 1, 100, 100)
-    leverage = st.slider("Плечо (только модель фьючерсов)", 1.0, 5.0, 1.0, 0.5, disabled=(market == "spot"))
-    funding_pct_8h = st.number_input("Допущение funding за 8 часов, %", min_value=0.0, max_value=1.0, value=0.01, step=0.01, disabled=(market == "spot"))
-    holdout_pct = st.slider("Out-of-sample часть истории, %", 10, 50, 25)
-    st.caption("Funding задан пользователем и не является фактической историей ставок. Ликвидации, биржевые минимумы и точный размер лота не моделируются.")
+    st.header("Рынок")
+    exchange = st.selectbox("Биржа котировок", ["binance", "bybit", "bingx"],
+                            format_func=lambda x: {"binance": "Binance", "bybit": "Bybit", "bingx": "BingX"}[x])
+    market_label = st.radio("Тип рынка", ["Спот", "Фьючерсы (только тест)"], index=0)
+    market = "spot" if market_label == "Спот" else "linear"
+    symbol = st.text_input("Торговая пара", "BTC/USDT").strip().upper()
+    timeframe = st.selectbox("Таймфрейм", ["15m", "30m", "1h", "2h", "4h", "1d"], index=5)
+    months = st.select_slider("История", options=[3, 6, 12, 18, 24], value=12,
+                              format_func=lambda x: f"{x} мес.")
 
-st.header("3. Выбор стратегий")
-selected = st.multiselect("Стратегии для сравнения", list(STRATEGIES.keys()), default=["EMA crossover", "RSI mean reversion", "Donchian breakout", "Buy & Hold benchmark"])
-with st.expander("Параметры стратегий", expanded=False):
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        ema_fast = st.number_input("EMA fast", 2, 100, 12)
-        ema_slow = st.number_input("EMA slow", 3, 300, 26)
-        rsi_entry = st.number_input("RSI вход ниже", 5, 45, 30)
-    with c2:
-        rsi_exit = st.number_input("RSI выход выше", 45, 90, 55)
-        donchian_entry = st.number_input("Donchian вход, бары", 5, 100, 20)
-        donchian_exit = st.number_input("Donchian выход, бары", 2, 50, 10)
-    with c3:
-        st.write("Используются индикаторы EMA, RSI, MACD, Bollinger Bands и Donchian. Их настройки для расширенных стратегий пока фиксированы.")
-        st.info("Для честного сравнения избегайте подгонки параметров под весь период истории.")
-params = {"ema_fast": int(ema_fast), "ema_slow": int(ema_slow), "rsi_entry": float(rsi_entry), "rsi_exit": float(rsi_exit),
-          "donchian_entry": int(donchian_entry), "donchian_exit": int(donchian_exit)}
+    with st.expander("Издержки и капитал", expanded=False):
+        initial = st.number_input("Начальный капитал, USDT", min_value=10.0, max_value=1000000.0,
+                                  value=1000.0, step=100.0)
+        fee_pct = st.number_input("Комиссия за сторону, %", min_value=0.0, max_value=1.0,
+                                  value=0.10, step=0.01)
+        slippage_pct = st.number_input("Проскальзывание за сторону, %", min_value=0.0, max_value=2.0,
+                                       value=0.05, step=0.01)
+        position_size = st.slider("Размер позиции, % капитала", 5, 100, 50, step=5)
+        holdout_pct = st.slider("История для финальной проверки, %", 10, 40, 25)
+    load_clicked = st.button("Загрузить рынок", type="primary", use_container_width=True)
+    st.caption("По умолчанию — спот без плеча. Доступность бирж зависит от сети и региона.")
 
-run = st.button("Загрузить котировки и выполнить анализ", type="primary", use_container_width=True)
-if run:
-    if not selected:
-        st.error("Выберите хотя бы одну стратегию.")
-    elif ema_fast >= ema_slow:
-        st.error("EMA fast должна быть меньше EMA slow.")
-    else:
+if load_clicked:
+    try:
+        with st.spinner("Загружаем свечи и проверяем данные…"):
+            data = fetch_ohlcv(symbol, timeframe, months, market, exchange)
+        if data is None or len(data) < 200:
+            st.error(f"Получено только {0 if data is None else len(data)} свечей. Нужно минимум 200. Попробуйте увеличить историю или выбрать другой таймфрейм.")
+        else:
+            st.session_state.csl_data = data
+            st.session_state.csl_result = None
+            st.session_state.csl_auto = None
+            st.session_state.csl_adaptive = None
+            st.session_state.csl_context = {
+                "exchange": exchange, "market": market, "symbol": symbol,
+                "timeframe": timeframe, "months": months, "initial": initial,
+                "fee": fee_pct / 100, "slippage": slippage_pct / 100,
+                "position_size": position_size, "holdout_pct": holdout_pct,
+            }
+            st.success(f"Загружено {len(data):,} свечей")
+    except Exception as exc:
+        st.error(f"Не удалось загрузить котировки: {exc}")
+        st.info("Для первой проверки используйте Binance, Спот, BTC/USDT, 1d и 6–12 месяцев.")
+
+data = st.session_state.csl_data
+ctx = st.session_state.get("csl_context")
+
+if data is None or ctx is None:
+    st.subheader("Начните с проверки рынка")
+    st.write("1. Слева выберите биржу и пару. 2. Нажмите **«Загрузить рынок»**. 3. Запустите проверку или автоматический поиск.")
+    st.info("Если стратегия не показывает преимущество после комиссий, приложение должно рекомендовать не торговать — это нормальный результат исследования.")
+    st.stop()
+
+st.success(f"{ctx['symbol']} · {ctx['timeframe']} · {ctx['exchange'].capitalize()} · {len(data):,} свечей")
+st.caption(f"Период: {data.index.min()} — {data.index.max()} UTC. Используются публичные котировки; последняя незакрытая свеча исключается.")
+
+home, auto_tab, adaptive_tab, paper_tab, data_tab = st.tabs([
+    "Обзор", "Найти стратегию", "Адаптивная модель", "Paper trading", "Данные и отчёты"
+])
+
+with home:
+    st.subheader("Проверить торговую гипотезу")
+    st.write("Выберите один подход для контрольного теста. Для автоматического выбора откройте вкладку **«Найти стратегию»**.")
+    preferred = ["EMA + RSI confirmation", "ATR trend filter", "MACD trend", "Buy & Hold benchmark"]
+    default_strategy = "EMA + RSI confirmation" if "EMA + RSI confirmation" in STRATEGIES else list(STRATEGIES)[0]
+    strategy = st.selectbox("Модель для проверки", list(STRATEGIES.keys()),
+                            index=list(STRATEGIES.keys()).index(default_strategy))
+    with st.expander("Дополнительные настройки стратегии", expanded=False):
+        ema_fast = st.number_input("Быстрая EMA", min_value=2, max_value=100, value=12)
+        ema_slow = st.number_input("Медленная EMA", min_value=3, max_value=300, value=26)
+        rsi_entry = st.number_input("RSI: вход ниже", min_value=5, max_value=45, value=30)
+        rsi_exit = st.number_input("RSI: выход выше", min_value=45, max_value=90, value=55)
+        donchian_entry = st.number_input("Donchian: вход, свечей", min_value=5, max_value=100, value=20)
+        donchian_exit = st.number_input("Donchian: выход, свечей", min_value=2, max_value=50, value=10)
+    params = {"ema_fast": int(ema_fast), "ema_slow": int(ema_slow), "rsi_entry": float(rsi_entry),
+              "rsi_exit": float(rsi_exit), "donchian_entry": int(donchian_entry),
+              "donchian_exit": int(donchian_exit)}
+    if st.button("Проверить стратегию", type="primary", key="run_one"):
+        if ema_fast >= ema_slow:
+            st.error("Быстрая EMA должна быть меньше медленной.")
+        else:
+            try:
+                with st.spinner("Проводим бэктест с учётом издержек…"):
+                    full = run_backtest(data, strategy, ctx["initial"], ctx["market"], ctx["fee"],
+                                        ctx["slippage"], 1.0, 0.0, params=params,
+                                        position_size_pct=ctx["position_size"])
+                    split = int(len(data) * (1 - ctx["holdout_pct"] / 100))
+                    test = data.iloc[split:]
+                    oos = run_backtest(test, strategy, ctx["initial"], ctx["market"], ctx["fee"],
+                                       ctx["slippage"], 1.0, 0.0, params=params,
+                                       position_size_pct=ctx["position_size"])
+                st.session_state.csl_result = {"strategy": strategy, "full": full, "oos": oos,
+                                                "params": params, "test_start": str(test.index.min())}
+            except Exception as exc:
+                st.error(f"Бэктест не выполнен: {exc}")
+    result = st.session_state.csl_result
+    if result:
+        m = result["full"]["metrics"]
+        o = result["oos"]["metrics"]
+        st.divider()
+        st.subheader("Результат")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Доходность", f"{m.get('Доходность, %', 0):.2f}%")
+        c2.metric("Макс. просадка", f"{m.get('Макс. просадка, %', 0):.2f}%")
+        c3.metric("Sharpe", f"{m.get('Sharpe', 0):.2f}")
+        c4.metric("Сделок", str(m.get("Сделок", 0)))
+        o1, o2, o3 = st.columns(3)
+        o1.metric("Финальная проверка", f"{o.get('Доходность, %', 0):.2f}%")
+        o2.metric("Просадка проверки", f"{o.get('Макс. просадка, %', 0):.2f}%")
+        o3.metric("Сделок на проверке", str(o.get("Сделок", 0)))
+        if o.get("Доходность, %", 0) <= 0:
+            st.warning("На отдельном проверочном отрезке прибыльность не подтверждена. Не включайте эту модель в реальную торговлю.")
+        elif o.get("Макс. просадка, %", 0) < -15:
+            st.warning("Проверочный отрезок положительный, но просадка высокая для консервативного подхода.")
+        else:
+            st.info("Результат выглядит достойным дальнейшей проверки, но не доказывает будущую прибыльность. Нужен paper trading.")
+        chart = pd.concat([result["full"]["equity"].rename("Вся история"),
+                           result["oos"]["equity"].rename("Отдельный OOS-сегмент")], axis=1)
+        st.line_chart(chart, use_container_width=True)
+        with st.expander("Подробные метрики и сделки", expanded=False):
+            st.dataframe(pd.DataFrame([{"Период": "Вся история", **m}, {"Период": "Проверочный сегмент", **o}]),
+                         use_container_width=True, hide_index=True)
+            trades = result["full"]["trades"]
+            if not trades.empty:
+                st.dataframe(trades, use_container_width=True, hide_index=True)
+                st.download_button("Скачать сделки CSV", trades.to_csv(index=False).encode("utf-8-sig"), "trades.csv")
+
+with auto_tab:
+    st.subheader("Пусть алгоритм проверит варианты за вас")
+    st.write("Алгоритм выбирает кандидата только по прошлым данным, затем проверяет его на следующем временном отрезке. Он может прийти к выводу, что торгового преимущества нет.")
+    auto_folds = st.slider("Количество проверочных отрезков", 3, 8, 5, key="simple_auto_folds")
+    auto_size = st.slider("Размер позиции для теста, % капитала", 10, 75, min(50, ctx["position_size"]), step=5, key="simple_auto_size")
+    if st.button("Найти стратегию автоматически", type="primary", key="simple_auto_run"):
         try:
-            with st.spinner(f"Загружаем публичные свечи {exchange_id.capitalize()}…"):
-                data = fetch_ohlcv(symbol, timeframe, months, market, exchange_id)
-            if len(data) < 200:
-                st.error(f"Получено только {len(data)} свечей. Для анализа нужно минимум 200; увеличьте историю или выберите другой таймфрейм/пару.")
-                st.stop()
-            split = int(len(data) * (1 - holdout_pct / 100))
-            train = data.iloc[:split].copy()
-            test = data.iloc[split:].copy()
-            rows, curves, trades_out, detail = [], {}, {}, {}
-            full_out = {}
-            for name in selected:
-                # Full-sample display is diagnostic only; OOS is the holdout segment.
-                full = run_backtest(data, name, initial, market, fee_pct / 100, slippage_pct / 100, leverage,
-                                    funding_pct_8h / 100, params=params, position_size_pct=position_size)
-                tr = run_backtest(train, name, initial, market, fee_pct / 100, slippage_pct / 100, leverage,
-                                  funding_pct_8h / 100, params=params, position_size_pct=position_size)
-                # Keep full history for indicators then evaluate only holdout via slicing the full result.
-                # The simple isolated OOS run below remains visible as a conservative basic holdout estimate.
-                os = run_backtest(test, name, initial, market, fee_pct / 100, slippage_pct / 100, leverage,
-                                  funding_pct_8h / 100, params=params, position_size_pct=position_size)
-                rows.extend([{"Стратегия": name, "Период": "Вся история (диагностика)", **full["metrics"]},
-                             {"Стратегия": name, "Период": "Train", **tr["metrics"]},
-                             {"Стратегия": name, "Период": "OOS (отдельный сегмент)", **os["metrics"]}])
-                curves[f"{name} — весь период"] = full["equity"].rename(f"{name} — весь период")
-                curves[f"{name} — OOS"] = os["equity"].rename(f"{name} — OOS")
-                trades_out[f"{name} — весь период"] = full["trades"]
-                trades_out[f"{name} — OOS"] = os["trades"]
-                detail[name] = full
-                full_out[name] = full
-            summary = pd.DataFrame(rows)
-            # Use Streamlit state so the report remains available after changing controls.
-            st.session_state.last_result = {"summary": summary, "curves": curves, "trades": trades_out, "detail": detail,
-                                            "data": data, "train": train, "test": test, "exchange": exchange_id,
-                                            "market": market, "symbol": symbol, "timeframe": timeframe,
-                                            "months": months, "params": params, "initial": initial,
-                                            "settings": {"fee_pct": fee_pct, "slippage_pct": slippage_pct,
-                                                          "leverage": leverage, "position_size": position_size,
-                                                          "funding_pct_8h": funding_pct_8h}}
-        except Exception as e:
-            st.error(f"Не удалось выполнить анализ: {e}")
-            st.info("Проверьте пару и рынок. Для проверки используйте BTC/USDT, Spot, 1h и 3–6 месяцев. Ограничения доступа к API могут зависеть от региона сервера.")
-
-res = st.session_state.last_result
-if res:
-    st.success(f"Загружено {len(res['data']):,} свечей: {res['data'].index.min()} — {res['data'].index.max()} (UTC)")
-    st.caption(f"Источник: публичные OHLCV • {res['exchange'].capitalize()} • {res['symbol']} • {res['timeframe']} • {res['market']}. Незакрытая последняя свеча исключается.")
-    summary = res["summary"]
-    st.subheader("Сводное сравнение")
-    st.dataframe(summary, use_container_width=True, hide_index=True)
-    full_rows = summary[summary["Период"] == "Вся история (диагностика)"].copy()
-    if not full_rows.empty:
-        st.subheader("Ключевые показатели по всей истории")
-        cols = st.columns(min(4, len(full_rows)))
-        for i, (_, row) in enumerate(full_rows.iterrows()):
-            with cols[i % len(cols)]:
-                st.metric(str(row["Стратегия"]), f"{row['Доходность, %']:.2f}%", f"DD {row['Макс. просадка, %']:.2f}%")
-    st.subheader("Кривая капитала")
-    chart_df = pd.concat(list(res["curves"].values()), axis=1)
-    st.line_chart(chart_df, use_container_width=True, height=380)
-    st.subheader("Цена и границы выборки")
-    st.line_chart(res["data"]["close"].rename("Close"), use_container_width=True, height=220)
-    st.caption(f"Train: до {res['train'].index.max()} UTC. OOS: с {res['test'].index.min()} UTC. Для последовательной оценки ниже используйте walk-forward.")
-    st.subheader("Сделки")
-    which = st.selectbox("Стратегия и период", list(res["trades"].keys()))
-    trades = res["trades"][which]
-    if trades.empty:
-        st.info("Сделок на выбранном участке нет.")
-    else:
-        st.dataframe(trades, use_container_width=True, hide_index=True)
-    st.subheader("Скачать отчёты")
-    st.download_button("Сводная таблица CSV", summary.to_csv(index=False).encode("utf-8-sig"), "strategy_metrics.csv", "text/csv")
-    all_trades = []
-    for label, frame in res["trades"].items():
-        cp = frame.copy(); cp.insert(0, "Набор", label); all_trades.append(cp)
-    trade_csv = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
-    st.download_button("Все сделки CSV", trade_csv.to_csv(index=False).encode("utf-8-sig"), "strategy_trades.csv", "text/csv")
-    csv_buf = io.StringIO()
-    res["data"].to_csv(csv_buf)
-    st.download_button("Исходные свечи CSV", csv_buf.getvalue().encode("utf-8-sig"), "ohlcv.csv", "text/csv")
-    st.download_button("Настройки эксперимента JSON", json.dumps({"exchange": res["exchange"], "market": res["market"], "symbol": res["symbol"], "timeframe": res["timeframe"], "months": res["months"], "params": res["params"], "settings": res["settings"], "selected_strategies": list(res["detail"].keys()), "generated_at_utc": datetime.now(timezone.utc).isoformat()}, ensure_ascii=False, indent=2).encode("utf-8"), "experiment_config.json", "application/json")
-
-    st.divider()
-    st.header("4. Walk-forward проверка")
-    st.write("Последовательная проверка на нескольких временных отрезках. Параметры фиксированы и не подбираются по каждому fold; индикаторы получают предшествующую историю. Это снижает проблему перезапуска индикаторов на границе, но не заменяет проверку исполнения на реальном рынке.")
-    wf_strategy = st.selectbox("Стратегия для walk-forward", list(res["detail"].keys()), key="wf_strategy")
-    wf_folds = st.slider("Количество последовательных OOS-отрезков", 3, 8, 5, key="wf_folds")
-    if st.button("Запустить walk-forward", key="run_wf"):
-        try:
-            settings = res["settings"]
-            wf = walk_forward_backtest(res["data"], wf_strategy, res["initial"], res["market"],
-                settings["fee_pct"]/100, settings["slippage_pct"]/100, settings["leverage"],
-                settings["funding_pct_8h"]/100, params=res["params"],
-                position_size_pct=settings["position_size"], folds=wf_folds)
-            st.session_state.wf_result = {"table": wf["folds"], "curves": wf["curves"], "strategy": wf_strategy}
-        except Exception as exc:
-            st.error(f"Walk-forward не выполнен: {exc}")
-    wf_res = st.session_state.get("wf_result")
-    if wf_res:
-        st.dataframe(wf_res["table"], use_container_width=True, hide_index=True)
-        st.line_chart(pd.concat(list(wf_res["curves"].values()), axis=1), use_container_width=True, height=260)
-        st.download_button("Скачать walk-forward CSV", wf_res["table"].to_csv(index=False).encode("utf-8-sig"), "walk_forward.csv", "text/csv")
-
-    st.divider()
-    st.header("5. Автоматический поиск торгового преимущества")
-    st.write("Система сама оценивает ограниченный набор конфигураций только на доступной прошлой истории, выбирает лучшую по риск-скорректированной оценке и проверяет её на следующем, не использованном при выборе отрезке. Затем процесс повторяется по времени. Ручной выбор стратегии не нужен.")
-    auto_folds = st.slider("Количество последовательных OOS-отрезков", 3, 8, 5, key="auto_folds")
-    auto_size = st.slider("Экспозиция для автоматического исследования, % капитала", 10, 100, 50, key="auto_size")
-    if st.button("Найти стратегию автоматически", type="primary", key="run_auto_research"):
-        try:
-            settings = res["settings"]
-            with st.spinner("Исследуем рынок, выбираем конфигурации на прошлых данных и проверяем их на OOS-отрезках…"):
-                auto = automatic_research(res["data"], res["initial"], res["market"],
-                    settings["fee_pct"]/100, settings["slippage_pct"]/100,
-                    settings["leverage"], settings["funding_pct_8h"]/100,
+            with st.spinner("Обучаем на прошлом и проверяем на следующих периодах…"):
+                st.session_state.csl_auto = automatic_research(
+                    data, ctx["initial"], ctx["market"], ctx["fee"], ctx["slippage"], 1.0, 0.0,
                     position_size_pct=auto_size, folds=auto_folds)
-            st.session_state.auto_research_result = auto
         except Exception as exc:
             st.error(f"Автоматический поиск не выполнен: {exc}")
-    auto_res = st.session_state.get("auto_research_result")
-    if auto_res:
-        st.subheader("Вердикт системы")
-        st.warning(auto_res["verdict"])
-        metrics = auto_res["summary"]
-        cols = st.columns(4)
-        for col, key in zip(cols, ["Положительных OOS-отрезков, %", "Медианная доходность OOS, %", "Медианная просадка OOS, %", "Кандидатов в поиске"]):
-            col.metric(key, metrics[key])
-        st.caption("Пороговые значения — фильтр исследовательской системы, а не гарантия будущей доходности. Параметры подбираются на прошлом участке каждого fold; результат оценивается только на следующем участке.")
-        st.subheader("Что алгоритм выбирал на каждом отрезке")
-        st.dataframe(auto_res["folds"], use_container_width=True, hide_index=True)
-        st.subheader("Какие стратегии выбирались чаще")
-        st.dataframe(auto_res["stable_winners"], use_container_width=True, hide_index=True)
-        st.line_chart(pd.concat(list(auto_res["curves"].values()), axis=1), use_container_width=True, height=280)
-        st.download_button("Скачать отчёт автоматического исследования CSV", auto_res["folds"].to_csv(index=False).encode("utf-8-sig"), "automatic_strategy_research.csv", "text/csv")
+    ar = st.session_state.csl_auto
+    if ar:
+        st.warning(ar["verdict"])
+        s = ar["summary"]
+        a, b, c = st.columns(3)
+        a.metric("Положительных периодов", f"{s['Положительных OOS-отрезков, %']:.1f}%")
+        b.metric("Медианная доходность", f"{s['Медианная доходность OOS, %']:.2f}%")
+        c.metric("Медианная просадка", f"{s['Медианная просадка OOS, %']:.2f}%")
+        st.dataframe(ar["folds"], use_container_width=True, hide_index=True)
+        st.line_chart(pd.concat(list(ar["curves"].values()), axis=1), use_container_width=True)
+        st.download_button("Скачать отчёт CSV", ar["folds"].to_csv(index=False).encode("utf-8-sig"), "auto_research.csv")
 
-    st.divider()
-    st.header("6. Адаптивный движок: режим рынка + выбор модели")
-    st.write("На каждой свече движок выбирает кандидата по его недавней доходности с поправкой на волатильность, используя только предшествующие свечи. При слабом сигнале или экстремальной волатильности остаётся вне рынка. Это проверяемая гипотеза, а не гарантированно прибыльный алгоритм.")
-    adapt_lookback = st.slider("Окно оценки кандидатов, свечей", 80, 1000, 240, step=40, key="adapt_lookback")
-    adapt_min_score = st.slider("Минимальная оценка кандидата", -0.10, 0.20, 0.0, step=0.01, key="adapt_min_score")
-    adapt_vol_pct = st.slider("Порог risk-off по волатильности, перцентиль", 0.80, 0.995, 0.98, step=0.005, key="adapt_vol_pct")
-    if st.button("Запустить адаптивный тест", key="run_adaptive"):
+with adaptive_tab:
+    st.subheader("Адаптивная модель")
+    st.write("На каждой свече модель оценивает предыдущие результаты кандидатов и может оставаться вне рынка. Это исследовательская гипотеза, не гарантированно прибыльный бот.")
+    with st.expander("Настройки адаптивной модели", expanded=False):
+        lookback = st.slider("Окно оценки, свечей", 80, 1000, 240, step=40, key="simple_lookback")
+        min_score = st.slider("Минимальная оценка сигнала", -0.10, 0.20, 0.0, step=0.01, key="simple_min_score")
+        vol_percentile = st.slider("Порог отключения при волатильности", 0.80, 0.995, 0.98, step=0.005, key="simple_vol")
+    if st.button("Проверить адаптивную модель", key="simple_adaptive_run"):
         try:
-            with st.spinner("Проверяем адаптивный движок на загруженной истории…"):
-                adapt = adaptive_regime_backtest(res["data"], res["initial"], res["market"],
-                    res["settings"]["fee_pct"] / 100, res["settings"]["slippage_pct"] / 100,
-                    lookback=adapt_lookback, min_score=adapt_min_score,
-                    risk_off_vol_percentile=adapt_vol_pct)
-                st.session_state.adaptive_result = adapt
+            with st.spinner("Проверяем модель на исторических данных…"):
+                st.session_state.csl_adaptive = adaptive_regime_backtest(
+                    data, ctx["initial"], ctx["market"], ctx["fee"], ctx["slippage"],
+                    lookback=lookback, min_score=min_score, risk_off_vol_percentile=vol_percentile)
         except Exception as exc:
-            st.error(f"Адаптивный тест не выполнен: {exc}")
-    adapt_res = st.session_state.get("adaptive_result")
-    if adapt_res:
-        st.warning(adapt_res["verdict"])
-        cols = st.columns(4)
-        for col, key in zip(cols, ["Доходность, %", "Макс. просадка, %", "Sharpe", "Время в рынке, %"]):
-            col.metric(key, adapt_res["metrics"][key])
-        st.subheader("Капитал и режим рынка")
-        st.line_chart(pd.concat([adapt_res["equity"], adapt_res["benchmark_equity"]], axis=1), use_container_width=True, height=260)
-        st.dataframe(adapt_res["candidate_counts"], use_container_width=True, hide_index=True)
-        st.subheader("Свечи, режим, выбранный кандидат и риск")
-        st.dataframe(adapt_res["details"].tail(500), use_container_width=True, hide_index=True)
-        st.download_button("Скачать отчёт адаптивного движка CSV", adapt_res["details"].to_csv().encode("utf-8-sig"), "adaptive_engine.csv", "text/csv")
+            st.error(f"Проверка не выполнена: {exc}")
+    ad = st.session_state.csl_adaptive
+    if ad:
+        st.warning(ad["verdict"])
+        metrics = ad["metrics"]
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Доходность", f"{metrics.get('Доходность, %', 0):.2f}%")
+        c2.metric("Макс. просадка", f"{metrics.get('Макс. просадка, %', 0):.2f}%")
+        c3.metric("Sharpe", f"{metrics.get('Sharpe', 0):.2f}")
+        st.line_chart(pd.concat([ad["equity"], ad["benchmark_equity"]], axis=1), use_container_width=True)
+        with st.expander("Детали по свечам", expanded=False):
+            st.dataframe(ad["details"].tail(500), use_container_width=True, hide_index=True)
+            st.download_button("Скачать детали CSV", ad["details"].to_csv().encode("utf-8-sig"), "adaptive_details.csv")
 
-    st.divider()
-    st.header("7. Paper trading — симуляция без реальных ордеров")
-    st.caption("Paper-счёт использует виртуальные покупки/продажи только на споте. Обработка идёт по кнопке, максимум одна обработка на закрытую свечу. На Streamlit Cloud SQLite-файл может сброситься при пересоздании контейнера; это не круглосуточный сервис.")
-    paper_strategy = st.selectbox("Стратегия paper-счёта", list(STRATEGIES.keys()), index=list(STRATEGIES.keys()).index("EMA crossover"), key="paper_strategy")
-    paper_cash = st.number_input("Начальный виртуальный баланс, USDT", min_value=10.0, max_value=1000000.0, value=1000.0, step=100.0, key="paper_cash")
-    acc = get_account()
-    p1, p2 = st.columns(2)
-    with p1:
-        if st.button("Создать / сбросить paper-счёт", key="reset_paper"):
-            reset_account(paper_cash)
-            st.success("Виртуальный счёт создан. История предыдущего paper-счёта очищена.")
-            st.rerun()
-    with p2:
-        if st.button("Обработать последнюю закрытую свечу", key="process_paper"):
-            if res["market"] != "spot":
-                st.error("Для этой первой версии paper trading выберите Spot, затем повторно загрузите котировки.")
-            elif not acc:
-                st.error("Сначала создайте paper-счёт.")
+with paper_tab:
+    st.subheader("Paper trading — только виртуальные сделки")
+    st.write("Симуляция работает по кнопке. Она не отправляет ордера на биржу и не является круглосуточным ботом.")
+    paper_strategy = st.selectbox("Стратегия для виртуального счёта", list(STRATEGIES.keys()),
+                                  index=list(STRATEGIES.keys()).index("EMA + RSI confirmation") if "EMA + RSI confirmation" in STRATEGIES else 0,
+                                  key="simple_paper_strategy")
+    cash = st.number_input("Начальный виртуальный баланс, USDT", min_value=10.0, max_value=1000000.0,
+                           value=1000.0, step=100.0, key="simple_paper_cash")
+    a, b = st.columns(2)
+    with a:
+        if st.button("Создать / сбросить счёт", key="simple_paper_reset"):
+            reset_account(cash)
+            st.success("Виртуальный счёт создан. Предыдущая история удалена.")
+    with b:
+        if st.button("Обработать последнюю закрытую свечу", type="primary", key="simple_paper_process"):
+            if ctx["market"] != "spot":
+                st.error("Paper trading доступен только для спота.")
+            elif get_account() is None:
+                st.error("Сначала создайте виртуальный счёт.")
             else:
                 try:
-                    paper_data = res["data"]
-                    # Current loaded dataset already excludes the unfinished candle.
-                    sig = signal_series(paper_data, paper_strategy, res["params"])
-                    latest_ts = paper_data.index[-1]
-                    outcome = process_closed_candle(latest_ts, res["symbol"], paper_strategy,
-                        float(paper_data["close"].iloc[-1]), float(sig.iloc[-1]),
-                        res["settings"]["fee_pct"]/100, res["settings"]["slippage_pct"]/100)
-                    if outcome["status"] == "duplicate": st.info(outcome["message"])
-                    else: st.success(f"Обработано: {outcome['action']} • капитал по последней цене: {outcome['equity']:.2f} USDT")
-                    st.rerun()
+                    sig = signal_series(data, paper_strategy, {})
+                    outcome = process_closed_candle(data.index[-1], ctx["symbol"], paper_strategy,
+                        float(data["close"].iloc[-1]), float(sig.iloc[-1]), ctx["fee"], ctx["slippage"])
+                    st.info(outcome.get("message", outcome.get("status", "Готово")))
                 except Exception as exc:
-                    st.error(f"Paper trading: {exc}")
-    acc = get_account()
-    if acc:
-        mark_price = float(res["data"]["close"].iloc[-1]) if res else 0.0
-        qty = float(acc["quantity"])
-        equity = float(acc["cash"]) + qty * mark_price
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Виртуальный капитал", f"{equity:.2f} USDT", f"{equity-float(acc['initial_cash']):+.2f}")
-        m2.metric("Свободные средства", f"{float(acc['cash']):.2f} USDT")
-        m3.metric("Количество актива", f"{qty:.8f}")
-        m4.metric("Цена оценки", f"{mark_price:.4f} USDT" if mark_price else "—")
-        events = get_events()
-        st.subheader("Журнал виртуальных операций")
-        if events.empty: st.info("Пока нет записей. Обработайте свечу после создания счёта.")
-        else:
+                    st.error(f"Не удалось обработать свечу: {exc}")
+    account = get_account()
+    if account:
+        qty = float(account.get("quantity") or 0)
+        cash_now = float(account.get("cash") or 0)
+        equity_now = cash_now + qty * float(data["close"].iloc[-1])
+        x, y, z = st.columns(3)
+        x.metric("Доступный USDT", f"{cash_now:.2f}")
+        y.metric("Количество актива", f"{qty:.6f}")
+        z.metric("Виртуальный капитал", f"{equity_now:.2f} USDT")
+    events = get_events(500)
+    if not events.empty:
+        with st.expander("Журнал виртуальных операций", expanded=True):
             st.dataframe(events, use_container_width=True, hide_index=True)
-            st.download_button("Скачать журнал paper trading CSV", events.to_csv(index=False).encode("utf-8-sig"), "paper_trading_journal.csv", "text/csv")
+            st.download_button("Скачать журнал CSV", events.to_csv(index=False).encode("utf-8-sig"), "paper_journal.csv")
 
-st.warning("Результаты бэктеста не гарантируют доходность. Не моделируются ликвидации, биржевые минимумы, точные уровни комиссий и исторический funding. Paper trading не отправляет ордера и не должен использоваться как подтверждение готовности стратегии к реальным деньгам.")
+with data_tab:
+    st.subheader("Данные и отчёты")
+    st.write("Исходные данные и результаты можно скачать для независимой проверки.")
+    st.download_button("Скачать свечи CSV", data.to_csv().encode("utf-8-sig"), "ohlcv.csv")
+    config = {**ctx, "generated_at_utc": datetime.now(timezone.utc).isoformat()}
+    st.download_button("Скачать настройки JSON", json.dumps(config, ensure_ascii=False, indent=2).encode("utf-8"), "experiment_settings.json", "application/json")
+    st.dataframe(data.tail(100), use_container_width=True)
+    with st.expander("Что означают показатели", expanded=False):
+        st.markdown("""
+        - **Доходность** — изменение капитала за тестовый период после моделируемых издержек.
+        - **Макс. просадка** — наибольшее падение капитала от предыдущего максимума.
+        - **Sharpe** — доходность относительно разброса результатов; сам по себе не доказывает преимущество.
+        - **OOS** — участок истории, который не использовался для настройки выбранной модели в этом простом тесте.
+        - **Paper trading** — виртуальные сделки без реального исполнения.
+        """)
+
+st.divider()
+st.caption("Результаты тестирования не гарантируют будущую прибыль. Не включайте реальные ордера без независимой проверки и длительного paper trading.")
