@@ -189,7 +189,8 @@ with adaptive_tab:
             with st.spinner("Проверяем модель на исторических данных…"):
                 st.session_state.csl_adaptive = adaptive_regime_backtest(
                     data, ctx["initial"], ctx["market"], ctx["fee"], ctx["slippage"],
-                    lookback=lookback, min_score=min_score, risk_off_vol_percentile=vol_percentile)
+                    lookback=lookback, min_score=min_score, risk_off_vol_percentile=vol_percentile,
+                    position_size_pct=ctx["position_size"])
         except Exception as exc:
             st.error(f"Проверка не выполнена: {exc}")
     ad = st.session_state.csl_adaptive
