@@ -20,6 +20,10 @@ def fetch_ohlcv(symbol="BTC/USDT", timeframe="1h", months=12, market="spot", exc
     options = {"defaultType": "swap" if market == "linear" and exchange_id == "bybit" else
                "future" if market == "linear" and exchange_id == "binance" else "spot"}
     exchange = supported[exchange_id]({"enableRateLimit": True, "options": options})
+    # Binance documents this host specifically for unauthenticated public spot market data.
+    # It may work when api.binance.com is blocked by the hosting region; it is not a guarantee.
+    if exchange_id == "binance" and market == "spot":
+        exchange.urls["api"]["public"] = "https://data-api.binance.vision/api/v3"
     exchange.load_markets()
 
     requested_symbol = symbol.strip().upper().replace(" ", "")
