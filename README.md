@@ -34,3 +34,8 @@ python -m unittest discover -s tests -v
 - Paper-журнал хранится в локальном SQLite-файле `paper_trading.db`. На Streamlit Community Cloud локальный файл может исчезнуть при пересоздании контейнера; для долговременного журнала нужен внешний PostgreSQL/managed DB.
 - Нет реального автотрейдинга, хранения ключей, контроля минимального лота, точной модели комиссий, ликвидаций, ордербука или фактической истории funding.
 - Исторические результаты и paper trading не гарантируют будущую доходность.
+
+## Automatic strategy research (v3)
+The app includes an automatic research tab. It evaluates a compact, predeclared candidate set, selects a configuration using only the expanding historical training window, and tests the selection on the next unseen OOS segment. The selection is repeated across sequential folds. It reports OOS return, drawdown, Sharpe, selected rules and a conservative verdict. It may explicitly conclude that no reliable edge was found.
+
+This is not a claim of profitable trading. The candidate universe is limited and OHLCV candles do not include order-book depth, exact fills, historical funding, liquidation mechanics or exchange-specific constraints. Treat results as screening evidence only; require persistent paper trading and out-of-sample confirmation before considering live execution. Automatic research does not place orders.

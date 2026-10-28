@@ -8,6 +8,7 @@ import streamlit as st
 
 from backtest import fetch_ohlcv, run_backtest, walk_forward_backtest, signal_series, STRATEGIES
 from paper import get_account, reset_account, get_events, process_closed_candle
+from auto_research import automatic_research
 
 st.set_page_config(page_title="Crypto Strategy Lab", page_icon="📈", layout="wide")
 st.title("Crypto Strategy Lab")
@@ -163,7 +164,39 @@ if res:
         st.download_button("Скачать walk-forward CSV", wf_res["table"].to_csv(index=False).encode("utf-8-sig"), "walk_forward.csv", "text/csv")
 
     st.divider()
-    st.header("5. Paper trading — симуляция без реальных ордеров")
+    st.header("5. Автоматический поиск торгового преимущества")
+    st.write("Система сама оценивает ограниченный набор конфигураций только на доступной прошлой истории, выбирает лучшую по риск-скорректированной оценке и проверяет её на следующем, не использованном при выборе отрезке. Затем процесс повторяется по времени. Ручной выбор стратегии не нужен.")
+    auto_folds = st.slider("Количество последовательных OOS-отрезков", 3, 8, 5, key="auto_folds")
+    auto_size = st.slider("Экспозиция для автоматического исследования, % капитала", 10, 100, 50, key="auto_size")
+    if st.button("Найти стратегию автоматически", type="primary", key="run_auto_research"):
+        try:
+            settings = res["settings"]
+            with st.spinner("Исследуем рынок, выбираем конфигурации на прошлых данных и проверяем их на OOS-отрезках…"):
+                auto = automatic_research(res["data"], res["initial"], res["market"],
+                    settings["fee_pct"]/100, settings["slippage_pct"]/100,
+                    settings["leverage"], settings["funding_pct_8h"]/100,
+                    position_size_pct=auto_size, folds=auto_folds)
+            st.session_state.auto_research_result = auto
+        except Exception as exc:
+            st.error(f"Автоматический поиск не выполнен: {exc}")
+    auto_res = st.session_state.get("auto_research_result")
+    if auto_res:
+        st.subheader("Вердикт системы")
+        st.warning(auto_res["verdict"])
+        metrics = auto_res["summary"]
+        cols = st.columns(4)
+        for col, key in zip(cols, ["Положительных OOS-отрезков, %", "Медианная доходность OOS, %", "Медианная просадка OOS, %", "Кандидатов в поиске"]):
+            col.metric(key, metrics[key])
+        st.caption("Пороговые значения — фильтр исследовательской системы, а не гарантия будущей доходности. Параметры подбираются на прошлом участке каждого fold; результат оценивается только на следующем участке.")
+        st.subheader("Что алгоритм выбирал на каждом отрезке")
+        st.dataframe(auto_res["folds"], use_container_width=True, hide_index=True)
+        st.subheader("Какие стратегии выбирались чаще")
+        st.dataframe(auto_res["stable_winners"], use_container_width=True, hide_index=True)
+        st.line_chart(pd.concat(list(auto_res["curves"].values()), axis=1), use_container_width=True, height=280)
+        st.download_button("Скачать отчёт автоматического исследования CSV", auto_res["folds"].to_csv(index=False).encode("utf-8-sig"), "automatic_strategy_research.csv", "text/csv")
+
+    st.divider()
+    st.header("6. Paper trading — симуляция без реальных ордеров")
     st.caption("Paper-счёт использует виртуальные покупки/продажи только на споте. Обработка идёт по кнопке, максимум одна обработка на закрытую свечу. На Streamlit Cloud SQLite-файл может сброситься при пересоздании контейнера; это не круглосуточный сервис.")
     paper_strategy = st.selectbox("Стратегия paper-счёта", list(STRATEGIES.keys()), index=list(STRATEGIES.keys()).index("EMA crossover"), key="paper_strategy")
     paper_cash = st.number_input("Начальный виртуальный баланс, USDT", min_value=10.0, max_value=1000000.0, value=1000.0, step=100.0, key="paper_cash")
