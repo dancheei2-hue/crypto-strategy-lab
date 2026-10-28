@@ -10,53 +10,78 @@ STRATEGIES = {
 }
 
 def fetch_ohlcv(symbol="BTC/USDT", timeframe="1h", months=12, market="spot", exchange_id="bybit"):
-    """Download public OHLCV candles from Bybit or Binance using CCXT."""
+    """Download public OHLCV candles. Binance spot uses data-api.binance.vision directly."""
     import ccxt
+    import json
+    from urllib.parse import urlencode
+    from urllib.request import urlopen, Request
+    from urllib.error import HTTPError, URLError
 
-    supported = {"bybit": ccxt.bybit, "binance": ccxt.binance}
+    requested_symbol = symbol.strip().upper().replace("/", "").replace(" ", "")
+    since_ms = int(time.time() * 1000) - int(months * 30.4375 * 24 * 60 * 60 * 1000)
+
+    # Do not call CCXT load_markets() for Binance spot: that calls exchangeInfo,
+    # which can return 451 even when the public market-data host is accessible.
+    if exchange_id == "binance" and market == "spot":
+        supported_timeframes = {"5m", "15m", "30m", "1h", "2h", "4h", "1d"}
+        if timeframe not in supported_timeframes:
+            raise ValueError(f"Неподдерживаемый таймфрейм: {timeframe}")
+        all_rows = []
+        base_url = "https://data-api.binance.vision/api/v3/klines"
+        while since_ms < int(time.time() * 1000):
+            query = urlencode({"symbol": requested_symbol, "interval": timeframe, "startTime": since_ms, "limit": 1000})
+            req = Request(base_url + "?" + query, headers={"User-Agent": "CryptoStrategyLab/1.0"})
+            try:
+                with urlopen(req, timeout=20) as response:
+                    rows = json.loads(response.read().decode("utf-8"))
+            except (HTTPError, URLError, TimeoutError) as exc:
+                raise RuntimeError(f"Не удалось получить Binance spot candles через data-api.binance.vision: {exc}") from exc
+            if not rows:
+                break
+            all_rows.extend(rows)
+            next_since = int(rows[-1][0]) + 1
+            if next_since <= since_ms or len(rows) < 2:
+                break
+            since_ms = next_since
+            time.sleep(0.15)
+        if not all_rows:
+            raise ValueError(f"Binance data API не вернул свечи для {requested_symbol}.")
+        df = pd.DataFrame([row[:6] for row in all_rows], columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df = df.drop_duplicates("timestamp").sort_values("timestamp")
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        df = df.set_index("timestamp")
+        if len(df) > 1:
+            df = df.iloc[:-1]
+        return df.astype(float)
+
+    supported = {"bybit": ccxt.bybit, "binance": ccxt.binance, "bingx": ccxt.bingx}
     if exchange_id not in supported:
         raise ValueError(f"Неподдерживаемая биржа: {exchange_id}")
-
-    options = {"defaultType": "swap" if market == "linear" and exchange_id == "bybit" else
-               "future" if market == "linear" and exchange_id == "binance" else "spot"}
+    options = {"defaultType": "future" if market == "linear" and exchange_id == "binance" else
+               "swap" if market == "linear" and exchange_id in ("bybit", "bingx") else "spot"}
     exchange = supported[exchange_id]({"enableRateLimit": True, "options": options})
-    # Binance documents this host specifically for unauthenticated public spot market data.
-    # It may work when api.binance.com is blocked by the hosting region; it is not a guarantee.
-    if exchange_id == "binance" and market == "spot":
-        exchange.urls["api"]["public"] = "https://data-api.binance.vision/api/v3"
     exchange.load_markets()
-
     requested_symbol = symbol.strip().upper().replace(" ", "")
-    if market == "linear":
-        # CCXT unified symbols for USDT perpetuals commonly use BTC/USDT:USDT.
-        base = requested_symbol.split(":")[0]
-        if exchange_id == "binance" and ":" not in requested_symbol:
-            requested_symbol = base + ":USDT"
-        elif exchange_id == "bybit" and ":" not in requested_symbol:
-            requested_symbol = base + ":USDT"
-
+    if market == "linear" and ":" not in requested_symbol:
+        requested_symbol = requested_symbol.split(":")[0] + ":USDT"
     if requested_symbol not in exchange.markets:
         alternatives = [requested_symbol.split(":")[0], requested_symbol.replace(":USDT", "")]
         found = next((candidate for candidate in alternatives if candidate in exchange.markets), None)
         if found:
             requested_symbol = found
         else:
-            raise ValueError(f"Пара {symbol} не найдена на {exchange_id} для рынка {market}. Для USDT-фьючерсов попробуйте BTC/USDT.")
-
-    since = exchange.milliseconds() - int(months * 30.4375 * 24 * 60 * 60 * 1000)
+            raise ValueError(f"Пара {symbol} не найдена на {exchange_id} для рынка {market}.")
+    since_ms = exchange.milliseconds() - int(months * 30.4375 * 24 * 60 * 60 * 1000)
     all_rows = []
-    limit = 1000
-    while since < exchange.milliseconds():
-        rows = exchange.fetch_ohlcv(requested_symbol, timeframe=timeframe, since=since, limit=limit)
+    while since_ms < exchange.milliseconds():
+        rows = exchange.fetch_ohlcv(requested_symbol, timeframe=timeframe, since=since_ms, limit=1000)
         if not rows:
             break
         all_rows.extend(rows)
         next_since = rows[-1][0] + 1
-        if next_since <= since:
+        if next_since <= since_ms or len(rows) < 2:
             break
-        since = next_since
-        if len(rows) < 2:
-            break
+        since_ms = next_since
         time.sleep(max(getattr(exchange, "rateLimit", 0), 0) / 1000)
     if not all_rows:
         raise ValueError(f"{exchange_id} не вернула исторические свечи для {requested_symbol}.")
@@ -64,7 +89,6 @@ def fetch_ohlcv(symbol="BTC/USDT", timeframe="1h", months=12, market="spot", exc
     df = df.drop_duplicates("timestamp").sort_values("timestamp")
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     df = df.set_index("timestamp")
-    # Never use the current, potentially incomplete candle.
     if len(df) > 1:
         df = df.iloc[:-1]
     return df.astype(float)

@@ -9,7 +9,7 @@ st.caption("Публичные котировки бирж • историче�
 
 with st.sidebar:
     st.header("Настройки")
-    exchange_id = st.selectbox("Биржа котировок", ["binance", "bybit"], format_func=lambda x: "Binance" if x == "binance" else "Bybit", index=0)
+    exchange_id = st.selectbox("Биржа котировок", ["bingx", "binance", "bybit"], format_func=lambda x: {"bingx": "BingX", "binance": "Binance", "bybit": "Bybit"}[x], index=0)
     market = st.selectbox("Рынок", ["spot", "linear"], format_func=lambda x: "Спот" if x == "spot" else "USDT-фьючерсы")
     symbol = st.text_input("Торговая пара", "BTC/USDT")
     timeframe = st.selectbox("Таймфрейм", ["5m", "15m", "30m", "1h", "2h", "4h", "1d"], index=3)
