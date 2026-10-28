@@ -1,6 +1,6 @@
 # Crypto Strategy Lab
 
-Russian-language Bybit historical backtest and paper-trading research MVP.
+Russian-language crypto strategy research MVP with selectable public market data from Binance or Bybit.
 
 ## Run
 ```bash
@@ -11,7 +11,7 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-The app downloads public OHLCV candles from Bybit via CCXT. No API keys are required for public candles. It excludes the latest candle because it may still be open.
+The app lets you select Binance or Bybit and downloads public OHLCV candles via CCXT. No API keys are required for public candles. It excludes the latest candle because it may still be open. Availability depends on the hosting region and exchange restrictions; Binance may also be blocked in some regions.
 
 ## Included baseline strategies
 - EMA crossover (12/26)

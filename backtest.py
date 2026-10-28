@@ -9,25 +9,41 @@ STRATEGIES = {
     "Donchian breakout": "donchian",
 }
 
-def fetch_bybit_ohlcv(symbol="BTC/USDT", timeframe="1h", months=12, market="spot"):
+def fetch_ohlcv(symbol="BTC/USDT", timeframe="1h", months=12, market="spot", exchange_id="bybit"):
+    """Download public OHLCV candles from Bybit or Binance using CCXT."""
     import ccxt
-    exchange = ccxt.bybit({"enableRateLimit": True, "options": {"defaultType": "swap" if market == "linear" else "spot"}})
-    if market == "linear":
-        if "/" in symbol and ":" not in symbol:
-            symbol = symbol + ":USDT"
+
+    supported = {"bybit": ccxt.bybit, "binance": ccxt.binance}
+    if exchange_id not in supported:
+        raise ValueError(f"Неподдерживаемая биржа: {exchange_id}")
+
+    options = {"defaultType": "swap" if market == "linear" and exchange_id == "bybit" else
+               "future" if market == "linear" and exchange_id == "binance" else "spot"}
+    exchange = supported[exchange_id]({"enableRateLimit": True, "options": options})
     exchange.load_markets()
-    if symbol not in exchange.markets:
-        # common user input fallback for linear contracts
-        candidate = symbol.replace(":USDT", "")
-        if market == "linear" and candidate in exchange.markets:
-            symbol = candidate
+
+    requested_symbol = symbol.strip().upper().replace(" ", "")
+    if market == "linear":
+        # CCXT unified symbols for USDT perpetuals commonly use BTC/USDT:USDT.
+        base = requested_symbol.split(":")[0]
+        if exchange_id == "binance" and ":" not in requested_symbol:
+            requested_symbol = base + ":USDT"
+        elif exchange_id == "bybit" and ":" not in requested_symbol:
+            requested_symbol = base + ":USDT"
+
+    if requested_symbol not in exchange.markets:
+        alternatives = [requested_symbol.split(":")[0], requested_symbol.replace(":USDT", "")]
+        found = next((candidate for candidate in alternatives if candidate in exchange.markets), None)
+        if found:
+            requested_symbol = found
         else:
-            raise ValueError(f"Символ {symbol} не найден на Bybit для рынка {market}.")
+            raise ValueError(f"Пара {symbol} не найдена на {exchange_id} для рынка {market}. Для USDT-фьючерсов попробуйте BTC/USDT.")
+
     since = exchange.milliseconds() - int(months * 30.4375 * 24 * 60 * 60 * 1000)
     all_rows = []
     limit = 1000
     while since < exchange.milliseconds():
-        rows = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=limit)
+        rows = exchange.fetch_ohlcv(requested_symbol, timeframe=timeframe, since=since, limit=limit)
         if not rows:
             break
         all_rows.extend(rows)
@@ -37,9 +53,9 @@ def fetch_bybit_ohlcv(symbol="BTC/USDT", timeframe="1h", months=12, market="spot
         since = next_since
         if len(rows) < 2:
             break
-        time.sleep(exchange.rateLimit / 1000)
+        time.sleep(max(getattr(exchange, "rateLimit", 0), 0) / 1000)
     if not all_rows:
-        raise ValueError("Bybit не вернул исторические свечи.")
+        raise ValueError(f"{exchange_id} не вернула исторические свечи для {requested_symbol}.")
     df = pd.DataFrame(all_rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df = df.drop_duplicates("timestamp").sort_values("timestamp")
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
@@ -48,6 +64,10 @@ def fetch_bybit_ohlcv(symbol="BTC/USDT", timeframe="1h", months=12, market="spot
     if len(df) > 1:
         df = df.iloc[:-1]
     return df.astype(float)
+
+# Backwards-compatible alias for existing scripts/tests.
+def fetch_bybit_ohlcv(symbol="BTC/USDT", timeframe="1h", months=12, market="spot"):
+    return fetch_ohlcv(symbol, timeframe, months, market, "bybit")
 
 def signal_series(df, strategy):
     close = df["close"]
