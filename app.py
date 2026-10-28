@@ -9,6 +9,7 @@ import streamlit as st
 from backtest import fetch_ohlcv, run_backtest, walk_forward_backtest, signal_series, STRATEGIES
 from paper import get_account, reset_account, get_events, process_closed_candle
 from auto_research import automatic_research
+from regime_engine import adaptive_regime_backtest
 
 st.set_page_config(page_title="Crypto Strategy Lab", page_icon="📈", layout="wide")
 st.title("Crypto Strategy Lab")
@@ -196,7 +197,36 @@ if res:
         st.download_button("Скачать отчёт автоматического исследования CSV", auto_res["folds"].to_csv(index=False).encode("utf-8-sig"), "automatic_strategy_research.csv", "text/csv")
 
     st.divider()
-    st.header("6. Paper trading — симуляция без реальных ордеров")
+    st.header("6. Адаптивный движок: режим рынка + выбор модели")
+    st.write("На каждой свече движок выбирает кандидата по его недавней доходности с поправкой на волатильность, используя только предшествующие свечи. При слабом сигнале или экстремальной волатильности остаётся вне рынка. Это проверяемая гипотеза, а не гарантированно прибыльный алгоритм.")
+    adapt_lookback = st.slider("Окно оценки кандидатов, свечей", 80, 1000, 240, step=40, key="adapt_lookback")
+    adapt_min_score = st.slider("Минимальная оценка кандидата", -0.10, 0.20, 0.0, step=0.01, key="adapt_min_score")
+    adapt_vol_pct = st.slider("Порог risk-off по волатильности, перцентиль", 0.80, 0.995, 0.98, step=0.005, key="adapt_vol_pct")
+    if st.button("Запустить адаптивный тест", key="run_adaptive"):
+        try:
+            with st.spinner("Проверяем адаптивный движок на загруженной истории…"):
+                adapt = adaptive_regime_backtest(res["data"], res["initial"], res["market"],
+                    res["settings"]["fee_pct"] / 100, res["settings"]["slippage_pct"] / 100,
+                    lookback=adapt_lookback, min_score=adapt_min_score,
+                    risk_off_vol_percentile=adapt_vol_pct)
+                st.session_state.adaptive_result = adapt
+        except Exception as exc:
+            st.error(f"Адаптивный тест не выполнен: {exc}")
+    adapt_res = st.session_state.get("adaptive_result")
+    if adapt_res:
+        st.warning(adapt_res["verdict"])
+        cols = st.columns(4)
+        for col, key in zip(cols, ["Доходность, %", "Макс. просадка, %", "Sharpe", "Время в рынке, %"]):
+            col.metric(key, adapt_res["metrics"][key])
+        st.subheader("Капитал и режим рынка")
+        st.line_chart(pd.concat([adapt_res["equity"], adapt_res["benchmark_equity"]], axis=1), use_container_width=True, height=260)
+        st.dataframe(adapt_res["candidate_counts"], use_container_width=True, hide_index=True)
+        st.subheader("Свечи, режим, выбранный кандидат и риск")
+        st.dataframe(adapt_res["details"].tail(500), use_container_width=True, hide_index=True)
+        st.download_button("Скачать отчёт адаптивного движка CSV", adapt_res["details"].to_csv().encode("utf-8-sig"), "adaptive_engine.csv", "text/csv")
+
+    st.divider()
+    st.header("7. Paper trading — симуляция без реальных ордеров")
     st.caption("Paper-счёт использует виртуальные покупки/продажи только на споте. Обработка идёт по кнопке, максимум одна обработка на закрытую свечу. На Streamlit Cloud SQLite-файл может сброситься при пересоздании контейнера; это не круглосуточный сервис.")
     paper_strategy = st.selectbox("Стратегия paper-счёта", list(STRATEGIES.keys()), index=list(STRATEGIES.keys()).index("EMA crossover"), key="paper_strategy")
     paper_cash = st.number_input("Начальный виртуальный баланс, USDT", min_value=10.0, max_value=1000000.0, value=1000.0, step=100.0, key="paper_cash")
